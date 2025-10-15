@@ -4,6 +4,7 @@ from setuptools.command.build_ext import build_ext
 from numpy import get_include
 from os import path
 from glob import glob
+import sys
 
 
 def get_numpy_include_dirs():
@@ -16,12 +17,16 @@ class build_ext_openmp(build_ext):
     openmp_compile_args = {
         'msvc':  [['/openmp']],
         'intel': [['-qopenmp']],
+        # Xcode's clang has OpenMP support disabled, -Xclang re-enables it, but requires libomp from https://mac.r-project.org/openmp/
+        'clang-mac':     [['-Xclang', '-fopenmp'], ['-Xpreprocessor','-fopenmp']],
         '*':     [['-fopenmp'], ['-Xpreprocessor','-fopenmp']],
     }
     openmp_link_args = openmp_compile_args # ?
 
     def build_extension(self, ext):
         compiler = self.compiler.compiler_type.lower()
+        if sys.platform == 'darwin':
+            compiler = 'clang-mac'
         if compiler.startswith('intel'):
             compiler = 'intel'
         if compiler not in self.openmp_compile_args:
