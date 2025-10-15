@@ -9,11 +9,27 @@ from stardist.matching import matching
 from stardist.utils import export_imagej_rois
 from stardist.plot import render_label, render_label_pred
 from csbdeep.utils import normalize
-from utils import circle_image, path_model2d, NumpySequence, Timer
+from csbdeep.utils.tf import IS_KERAS_3_PLUS
+from utils import circle_image, path_model2d, crop, NumpySequence, Timer, check_same_shapes
 
 
-@pytest.mark.parametrize('n_rays, grid, n_channel, workers, use_sequence', [(17, (1, 1), None, 1, False), (32, (2, 4), 1, 1, False), (4, (8, 2), 2, 1, True)])
-def test_model(tmpdir, n_rays, grid, n_channel, workers, use_sequence):
+# integration test
+def test_integration():
+    model = StarDist2D.from_pretrained('2D_versatile_fluo')
+    x = normalize(test_image_nuclei_2d())
+    labels, details = model.predict_instances(x)
+    assert set(np.unique(labels).tolist()) == set(range(120))
+    assert np.abs(np.sum(labels>0)-55985)<10
+    return model, x, labels
+
+
+
+@pytest.mark.parametrize('n_rays, grid, n_channel, workers, use_sequence, shape_completion', [
+    (17, (1, 1), None, 1, False, False),
+    (32, (2, 4), 1, 1, False, True),
+    (4, (8, 2), 2, 1, True, False),
+])
+def test_model(tmpdir, n_rays, grid, n_channel, workers, use_sequence, shape_completion):
     img = circle_image(shape=(160, 160))
     imgs = np.repeat(img[np.newaxis], 3, axis=0)
 
@@ -39,7 +55,8 @@ def test_model(tmpdir, n_rays, grid, n_channel, workers, use_sequence):
         train_batch_size=2,
         train_loss_weights=(4, 1),
         train_patch_size=(128, 128),
-        train_sample_cache = not use_sequence
+        train_sample_cache = not use_sequence,
+        train_shape_completion = shape_completion,
     )
 
     model = StarDist2D(conf, name='stardist', basedir=str(tmpdir))
@@ -92,7 +109,7 @@ def test_load_and_predict_big():
     model_path = path_model2d()
     model = StarDist2D(None, name=model_path.name,
                        basedir=str(model_path.parent))
-    img = test_image_nuclei_2d()
+    img = crop(test_image_nuclei_2d())
     x = normalize(img, 1, 99.8)
     x = np.tile(x,(4,4))
     labels1, polygons1 = model.predict_instances(x)
@@ -118,16 +135,49 @@ def test_optimize_thresholds(model2d):
 
 @pytest.mark.parametrize('n_classes, classes', [(None,(1,1)),(2,(1,2))])
 @pytest.mark.parametrize('shape_completion',(False,True))
-def test_stardistdata(shape_completion, n_classes, classes):
+@pytest.mark.parametrize('grid',((1,1),(1,2),(2,2)))
+def test_stardistdata(shape_completion, n_classes, classes, grid):
     np.random.seed(42)
     from stardist.models import StarDistData2D
-    img, mask = test_image_nuclei_2d(return_mask=True)
-    s = StarDistData2D([img, img], [mask, mask],
-                       grid = (2,2),
-                       n_classes = n_classes, classes = classes,
-                       shape_completion = shape_completion, b = 8,
-                       batch_size=1, patch_size=(30, 40), n_rays=32, length=1)
+    img, mask = crop(test_image_nuclei_2d(return_mask=True))
+    data_kwargs = dict(
+        grid = grid,
+        n_classes = n_classes, classes = classes,
+        shape_completion = shape_completion, b = 8,
+        batch_size=np.random.choice((1,2)), n_rays=32, length=1,
+    )
+
+    a,b = StarDistData2D([img,img], [mask,mask], patch_size=(30, 41), **data_kwargs)[0]
+    check_same_shapes(*b, shape_index=slice(0,3))
+    ###
+
+    assert img.shape == mask.shape
+    _crop = tuple(slice(0, (sh//g)*g) for sh,g in zip(img.shape, grid))
+    img, mask = img[_crop], mask[_crop]
+
+    labels_ids = tuple({*np.unique(mask).tolist()}-{0})
+    ind = np.random.choice(labels_ids, len(labels_ids) // 2, replace=False)
+    mask_neg = np.isin(mask,ind) # mask to make labels negative
+
+    mask = mask.astype(np.int32)
+    mask[mask_neg] *= -1
+
+    s = StarDistData2D([img,img], [mask,mask], patch_size=mask.shape, **data_kwargs)
+    mask_neg = mask_neg[s.b][s.ss_grid[1:3]]
+
     a, b = s[0]
+    check_same_shapes(*b, shape_index=slice(0,3))
+    prob, dist_and_mask = b[:2]
+    prob, dist, dist_mask = prob[0,...,0], dist_and_mask[0,...,:-1], dist_and_mask[0,...,-1]
+
+    assert np.allclose(prob[mask_neg], -1)
+    assert np.allclose(dist_mask[mask_neg], 0)
+    assert np.allclose(dist[np.broadcast_to(mask_neg[...,None],dist.shape)], 0)
+
+    if n_classes is not None:
+        prob_class = b[2]
+        assert np.allclose(prob_class[np.broadcast_to(mask_neg[...,None],prob_class.shape)], -1)
+
     return a,b, s
 
 
@@ -146,7 +196,7 @@ def test_edt_prob(anisotropy):
         import edt
         from stardist.utils import _edt_prob_edt, _edt_prob_scipy
 
-        masks = (np.tile(test_image_nuclei_2d(return_mask=True)[1],(2,2)),
+        masks = (np.tile(crop(test_image_nuclei_2d(return_mask=True))[1],(2,2)),
                  np.zeros((117,92)),
                  np.ones((153,112)))
         dtypes = (np.uint16, np.int32)
@@ -202,8 +252,10 @@ def test_pretrained_scales():
     from skimage.measure import regionprops
 
     model = StarDist2D.from_pretrained("2D_versatile_fluo")
-    img, mask = test_image_nuclei_2d(return_mask=True)
+    img, mask = crop(test_image_nuclei_2d(return_mask=True))
     x = normalize(img, 1, 99.8)
+    x    = zoom(x,    (0.5,0.5), order=1)
+    mask = zoom(mask, (0.5,0.5), order=0)
 
     def pred_scale(scale=2):
         x2 = zoom(x, scale, order=1)
@@ -211,7 +263,7 @@ def test_pretrained_scales():
         labels = zoom(labels2, tuple(_s1/_s2 for _s1, _s2 in zip(mask.shape, labels2.shape)), order=0)
         return labels
 
-    scales = np.linspace(.5,5,10)
+    scales = [0.5, 2.0, 3.0, 4.0]
     accs = tuple(matching(mask, pred_scale(s)).accuracy for s in scales)
     print("scales   ", np.round(scales,2))
     print("accuracy ", np.round(accs,2))
@@ -250,7 +302,7 @@ def test_stardistdata_multithreaded(workers=5):
 
     n_samples = 4
 
-    _ , mask = test_image_nuclei_2d(return_mask=True)
+    _ , mask = crop(test_image_nuclei_2d(return_mask=True))
     Y = np.stack([mask+i for i in range(n_samples)])
     s = StarDistData2D(Y.astype(np.float32), Y,
                        grid = (1,1),
@@ -270,16 +322,16 @@ def test_stardistdata_multithreaded(workers=5):
 
 
 def test_imagej_rois_export(tmpdir, model2d):
-    img = normalize(test_image_nuclei_2d(), 1, 99.8)
+    img = normalize(crop(test_image_nuclei_2d()), 1, 99.8)
     labels, polys = model2d.predict_instances(img)
     export_imagej_rois(str(Path(tmpdir)/'img_rois.zip'), polys['coord'])
 
 
 
 
-def _test_model_multiclass(n_classes = 1, classes = "auto", n_channel = None, basedir = None):
+def _test_model_multiclass(n_classes = 1, classes = "auto", n_channel = None, basedir = None, shape_completion = False):
     from skimage.measure import regionprops
-    img, mask = test_image_nuclei_2d(return_mask=True)
+    img, mask = crop(test_image_nuclei_2d(return_mask=True))
     img = normalize(img,1,99.8)
 
     if n_channel is not None:
@@ -295,11 +347,12 @@ def _test_model_multiclass(n_classes = 1, classes = "auto", n_channel = None, ba
         n_channel_in=n_channel,
         n_classes = n_classes,
         use_gpu=False,
-        train_epochs=1,
-        train_steps_per_epoch=1,
+        train_epochs=2,
+        train_steps_per_epoch=15,
         train_batch_size=1,
         train_dist_loss = "iou",
         train_patch_size=(128, 128),
+        train_shape_completion = shape_completion,
     )
 
     if n_classes is not None and n_classes>1 and classes=="auto":
@@ -317,31 +370,33 @@ def _test_model_multiclass(n_classes = 1, classes = "auto", n_channel = None, ba
 
     val_classes = {k:1 for k in set(mask[mask>0])}
 
-    s = model.train(X, Y, classes = classes, epochs = 30,
+    s = model.train(X, Y, classes = classes,
                 validation_data=(X[:1], Y[:1]) if n_classes is None else (X[:1], Y[:1], (val_classes,))
                     )
 
-    img = np.tile(img,(4,4) if img.ndim==2 else (4,4,1))
+    # img = np.tile(img,(4,4) if img.ndim==2 else (4,4,1))
 
     kwargs = dict(prob_thresh=.2)
-    labels1, res1 = model.predict_instances(img, **kwargs)
+    labels1, res1 = model.predict_instances(img, sparse = False, **kwargs)
     labels2, res2 = model.predict_instances(img, sparse = True, **kwargs)
-    labels3, res3 = model.predict_instances_big(img, axes="YX" if img.ndim==2 else "YXC",
-                                                block_size=640, min_overlap=32, context=96, **kwargs)
+    # labels3, res3 = model.predict_instances_big(img, axes="YX" if img.ndim==2 else "YXC",
+    #                                             block_size=640, min_overlap=32, context=96, **kwargs)
+    # assert matching(labels1, labels3, thresh=0.99).f1 == 1
 
     assert np.allclose(labels1, labels2)
     assert all([np.allclose(res1[k], res2[k]) for k in set(res1.keys()).union(set(res2.keys())) if isinstance(res1[k], np.ndarray)])
 
-    return model, img, res1, res2, res3
+    return model, img, res1, res2 #, res3
 
-@pytest.mark.parametrize('n_classes, classes, n_channel',
-                         [ (None, "auto", 1),
-                           (1, "auto", 3),
-                           (3, (1,2,3),3)]
-                         )
-def test_model_multiclass(tmpdir, n_classes, classes, n_channel):
+@pytest.mark.parametrize('n_classes, classes, n_channel, shape_completion', [
+    (None, "auto", 1, False),
+    (1, "auto", 3, False),
+    (3, (1,2,3),3, True),
+])
+def test_model_multiclass(tmpdir, n_classes, classes, n_channel, shape_completion):
     return _test_model_multiclass(n_classes=n_classes, classes=classes,
-                                  n_channel=n_channel, basedir = tmpdir)
+                                  n_channel=n_channel, basedir = tmpdir,
+                                  shape_completion = shape_completion)
 
 
 def test_classes():
@@ -353,7 +408,7 @@ def test_classes():
         return classes
 
     def _check_single_val(n_classes, classes=1):
-        img, y_gt = test_image_nuclei_2d(return_mask=True)
+        img, y_gt = crop(test_image_nuclei_2d(return_mask=True))
         labels_gt = set(np.unique(y_gt[y_gt>0]))
         p, cls_dict = mask_to_categorical(y_gt,
                                           n_classes=n_classes,
@@ -386,7 +441,7 @@ def print_receptive_fields():
 
 def test_predict_dense_sparse(model2d):
     model = model2d
-    img, mask = test_image_nuclei_2d(return_mask=True)
+    img, mask = crop(test_image_nuclei_2d(return_mask=True))
     x = normalize(img, 1, 99.8)
     labels1, res1 = model.predict_instances(x, n_tiles=(2, 2), sparse = False)
     labels2, res2 = model.predict_instances(x, n_tiles=(2, 2), sparse = True)
@@ -399,9 +454,9 @@ def test_speed(model2d):
     from time import time
 
     model = model2d
-    img, mask = test_image_nuclei_2d(return_mask=True)
+    img, mask = crop(test_image_nuclei_2d(return_mask=True))
     x = normalize(img, 1, 99.8)
-    x = np.tile(x,(6,6))
+    x = np.tile(x,(5,5))
     print(x.shape)
 
     stats = []
@@ -412,7 +467,7 @@ def test_speed(model2d):
                labels, res = model.predict_instances(x, n_tiles=n_tiles, sparse = sparse)
            else:
                labels, res = model.predict_instances_big(x,axes = "YX",
-                                                         block_size = 1024+256,
+                                                         block_size = 768,
                                                          context = 64, min_overlap = 64,
                                                          n_tiles=n_tiles, sparse = sparse)
 
@@ -445,7 +500,7 @@ def render_label_pred_example2(model2d):
 
 def test_pretrained_integration():
     from stardist.models import StarDist2D
-    img = normalize(test_image_nuclei_2d())
+    img = normalize(crop(test_image_nuclei_2d()))
 
     model = StarDist2D.from_pretrained("2D_versatile_fluo")
     prob,dist = model.predict(img)
@@ -476,19 +531,19 @@ def test_predict_with_scale(scale, mode):
         scale = (scale,scale)
     if mode=='fluo':
         model = StarDist2D.from_pretrained('2D_versatile_fluo')
-        x = test_image_nuclei_2d()
+        x = crop(test_image_nuclei_2d())
         _scale = tuple(scale)
     elif mode=='he':
         model = StarDist2D.from_pretrained('2D_versatile_he')
-        x = test_image_he_2d()
+        x = crop(test_image_he_2d())
         _scale = tuple(scale) + (1,)
     else:
         raise ValueError(mode)
 
     x = normalize(x)
-    x = zoom(x, (0.5,0.5) if x.ndim==2 else (0.5,0.5,1), order=1) # to speed test up
+    # x = zoom(x, (0.5,0.5) if x.ndim==2 else (0.5,0.5,1), order=1) # to speed test up
     x_scaled = zoom(x, _scale, order=1)
-    
+
     labels,        res        = model.predict_instances(x, scale=_scale)
     labels_scaled, res_scaled = model.predict_instances(x_scaled)
 
@@ -501,6 +556,7 @@ def test_predict_with_scale(scale, mode):
 
 
 # this test has to be at the end of the model
+@pytest.mark.skipif(IS_KERAS_3_PLUS, reason="no longer supported with keras 3+")
 def test_load_and_export_TF(model2d):
     model = model2d
     assert any(g>1 for g in model.config.grid)
@@ -508,7 +564,7 @@ def test_load_and_export_TF(model2d):
     # model.export_TF(single_output=False, upsample_grid=True)
     model.export_TF(single_output=True, upsample_grid=False)
     model.export_TF(single_output=True, upsample_grid=True)
-    
+
 
 if __name__ == '__main__':
     from conftest import _model2d

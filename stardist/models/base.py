@@ -8,14 +8,14 @@ from tqdm import tqdm
 from collections import namedtuple
 from pathlib import Path
 import threading
+import functools
 import scipy.ndimage as ndi
 import numbers
 
 from csbdeep.models.base_model import BaseModel
-from csbdeep.utils.tf import export_SavedModel, keras_import, IS_TF_1, CARETensorBoard
+from csbdeep.utils.tf import export_SavedModel, keras_import, IS_TF_1, CARETensorBoard, BACKEND as K
 
 import tensorflow as tf
-K = keras_import('backend')
 Sequence = keras_import('utils', 'Sequence')
 Adam = keras_import('optimizers', 'Adam')
 ReduceLROnPlateau, TensorBoard = keras_import('callbacks', 'ReduceLROnPlateau', 'TensorBoard')
@@ -27,23 +27,26 @@ from csbdeep.data import Resizer
 
 from ..sample_patches import get_valid_inds
 from ..nms import _ind_prob_thresh
-from ..utils import _is_power_of_2,  _is_floatarray, optimize_threshold
+from ..utils import _is_power_of_2,  _is_floatarray, optimize_threshold, grid_divisible_patch_size
 
 # TODO: helper function to check if receptive field of cnn is sufficient for object sizes in GT
 
 def generic_masked_loss(mask, loss, weights=1, norm_by_mask=True, reg_weight=0, reg_penalty=K.abs):
+    mask = K.cast(mask, K.floatx())
+    weights = K.cast(weights, K.floatx())
+    _reg_weight = K.cast(reg_weight, K.floatx())
     def _loss(y_true, y_pred):
         actual_loss = K.mean(mask * weights * loss(y_true, y_pred), axis=-1)
         norm_mask = (K.mean(mask) + K.epsilon()) if norm_by_mask else 1
         if reg_weight > 0:
             reg_loss = K.mean((1-mask) * reg_penalty(y_pred), axis=-1)
-            return actual_loss / norm_mask + reg_weight * reg_loss
+            return actual_loss / norm_mask + _reg_weight * reg_loss
         else:
             return actual_loss / norm_mask
     return _loss
 
 def masked_loss(mask, penalty, reg_weight, norm_by_mask):
-    loss = lambda y_true, y_pred: penalty(y_true - y_pred)
+    loss = lambda y_true, y_pred: penalty(K.cast(y_true, K.floatx()) - y_pred)
     return generic_masked_loss(mask, loss, reg_weight=reg_weight, norm_by_mask=norm_by_mask)
 
 # TODO: should we use norm_by_mask=True in the loss or only in a metric?
@@ -67,13 +70,16 @@ def masked_metric_mse(mask):
     return relevant_mse
 
 def kld(y_true, y_pred):
-    y_true = K.clip(y_true, K.epsilon(), 1)
-    y_pred = K.clip(y_pred, K.epsilon(), 1)
+    y_true = K.cast(y_true, K.floatx())
+    mask = y_true >= 0 # pixels to ignore have y_true == -1
+    y_true = K.clip(y_true[mask], K.epsilon(), 1)
+    y_pred = K.clip(y_pred[mask], K.epsilon(), 1)
     return K.mean(K.binary_crossentropy(y_true, y_pred) - K.binary_crossentropy(y_true, y_true), axis=-1)
 
 
 def masked_loss_iou(mask, reg_weight=0, norm_by_mask=True):
     def iou_loss(y_true, y_pred):
+        y_true = K.cast(y_true, K.floatx())
         axis = -1 if backend_channels_last() else 1
         # y_pred can be negative (since not constrained) -> 'inter' can be very large for y_pred << 0
         # - clipping y_pred values at 0 can lead to vanishing gradients
@@ -88,6 +94,7 @@ def masked_loss_iou(mask, reg_weight=0, norm_by_mask=True):
 
 def masked_metric_iou(mask, reg_weight=0, norm_by_mask=True):
     def iou_metric(y_true, y_pred):
+        y_true = K.cast(y_true, K.floatx())
         axis = -1 if backend_channels_last() else 1
         y_pred = K.maximum(0., y_pred)
         inter = K.mean(K.square(K.minimum(y_true,y_pred)), axis=axis)
@@ -110,10 +117,11 @@ def weighted_categorical_crossentropy(weights, ndim, gamma=0):
     shape = [1]*(ndim+2)
     shape[axis] = len(weights)
     weights = np.broadcast_to(weights, shape)
-    weights = K.constant(weights)
+    weights = K.cast(weights, K.floatx())
 
     def weighted_cce(y_true, y_pred):
         # ignore pixels that have y_true (prob_class) < 0
+        y_true = K.cast(y_true, K.floatx())
         mask = K.cast(y_true>=0, K.floatx())
 
         #normalize
@@ -212,9 +220,9 @@ class StarDistDataBase(RollingSequence):
 
     def __init__(self, X, Y, n_rays, grid, batch_size, patch_size, length,
                  n_classes=None, classes=None,
-                 use_gpu=False, sample_ind_cache=True, maxfilter_patch_size=None, augmenter=None, foreground_prob=0):
+                 use_gpu=False, sample_ind_cache=True, maxfilter_patch_size=None, augmenter=None, foreground_prob=0, keras_kwargs=None):
 
-        super().__init__(data_size=len(X), batch_size=batch_size, length=length, shuffle=True)
+        super().__init__(data_size=len(X), batch_size=batch_size, length=length, shuffle=True, keras_kwargs=keras_kwargs)
 
         if isinstance(X, (np.ndarray, tuple, list)):
             X = [x.astype(np.float32, copy=False) for x in X]
@@ -231,6 +239,7 @@ class StarDistDataBase(RollingSequence):
         len(classes)==len(X) or _raise(ValueError("X and classes must have same length"))
 
         self.n_classes, self.classes = n_classes, classes
+        patch_size = grid_divisible_patch_size(patch_size, grid)
 
         nD = len(patch_size)
         assert nD in (2,3)
@@ -268,7 +277,7 @@ class StarDistDataBase(RollingSequence):
             from gputools import max_filter
             self.max_filter = lambda y, patch_size: max_filter(y.astype(np.float32), patch_size)
         else:
-            from scipy.ndimage.filters import maximum_filter
+            from scipy.ndimage import maximum_filter
             self.max_filter = lambda y, patch_size: maximum_filter(y, patch_size, mode='constant')
 
         self.maxfilter_patch_size = maxfilter_patch_size if maxfilter_patch_size is not None else self.patch_size
@@ -288,7 +297,7 @@ class StarDistDataBase(RollingSequence):
             inds = _ind_cache[k]
         else:
             patch_filter = (lambda y,p: self.max_filter(y, self.maxfilter_patch_size) > 0) if foreground_only else None
-            inds = get_valid_inds((self.Y[k],)+self.channels_as_tuple(self.X[k]), self.patch_size, patch_filter=patch_filter)
+            inds = get_valid_inds(self.Y[k], self.patch_size, patch_filter=patch_filter)
             if self.sample_ind_cache:
                 with self.lock:
                     _ind_cache[k] = inds
@@ -393,8 +402,11 @@ class StarDistBase(BaseModel):
                             'mae': masked_loss_mae,
                             'iou': masked_loss_iou,
                             }[self.config.train_dist_loss]
-        prob_loss = 'binary_crossentropy'
 
+        def prob_loss(y_true, y_pred):
+            y_true = K.cast(y_true, K.floatx())
+            mask = y_true >= 0
+            return K.mean(K.binary_crossentropy(y_true[mask], y_pred[mask]), axis=-1)
 
         def split_dist_true_mask(dist_true_mask):
             return tf.split(dist_true_mask, num_or_size_splits=[self.config.n_rays,-1], axis=-1)
@@ -525,7 +537,7 @@ class StarDistBase(BaseModel):
         return x, axes, axes_net, axes_net_div_by, _permute_axes, resizer, n_tiles, grid, grid_dict, channel, predict_direct, tiling_setup
 
 
-    def predict(self, img, axes=None, normalizer=None, n_tiles=None, show_tile_progress=True, **predict_kwargs):
+    def _predict_generator(self, img, axes=None, normalizer=None, n_tiles=None, show_tile_progress=True, **predict_kwargs):
         """Predict.
 
         Parameters
@@ -560,6 +572,7 @@ class StarDistBase(BaseModel):
 
         """
 
+        predict_kwargs.setdefault('verbose', 0)
         x, axes, axes_net, axes_net_div_by, _permute_axes, resizer, n_tiles, grid, grid_dict, channel, predict_direct, tiling_setup = \
             self._predict_setup(img, axes, normalizer, n_tiles, show_tile_progress, predict_kwargs)
 
@@ -587,6 +600,7 @@ class StarDistBase(BaseModel):
                 # print(s_src,s_dst)
                 for part, part_tile in zip(result, result_tile):
                     part[s_dst] = part_tile[s_src]
+                yield  # yield None after each processed tile
         else:
             # predict_direct -> prob, dist, [prob_class if multi_class]
             result = predict_direct(x)
@@ -605,10 +619,20 @@ class StarDistBase(BaseModel):
             # prob_class
             result[2] = np.moveaxis(result[2],channel,-1)
 
-        return tuple(result)
+        # last "yield" is the actual output that would have been "return"ed if this was a regular function
+        yield tuple(result)
 
 
-    def predict_sparse(self, img, prob_thresh=None, axes=None, normalizer=None, n_tiles=None, show_tile_progress=True, b=2, **predict_kwargs):
+    @functools.wraps(_predict_generator)
+    def predict(self, *args, **kwargs):
+        # return last "yield"ed value of generator
+        r = None
+        for r in self._predict_generator(*args, **kwargs):
+            pass
+        return r
+
+
+    def _predict_sparse_generator(self, img, prob_thresh=None, axes=None, normalizer=None, n_tiles=None, show_tile_progress=True, b=2, **predict_kwargs):
         """ Sparse version of model.predict()
         Returns
         -------
@@ -616,6 +640,7 @@ class StarDistBase(BaseModel):
         """
         if prob_thresh is None: prob_thresh = self.thresholds.prob
 
+        predict_kwargs.setdefault('verbose', 0)
         x, axes, axes_net, axes_net_div_by, _permute_axes, resizer, n_tiles, grid, grid_dict, channel, predict_direct, tiling_setup = \
             self._predict_setup(img, axes, normalizer, n_tiles, show_tile_progress, predict_kwargs)
 
@@ -665,6 +690,7 @@ class StarDistBase(BaseModel):
                     p = results_tile[2][s_src].copy()
                     p = np.moveaxis(p,channel,-1)
                     prob_classa.extend(p[inds])
+                yield  # yield None after each processed tile
 
         else:
             # predict_direct -> prob, dist, [prob_class if multi_class]
@@ -690,25 +716,35 @@ class StarDistBase(BaseModel):
         proba = proba[idx]
         dista = dista[idx]
         pointsa = pointsa[idx]
-        
+
+        # last "yield" is the actual output that would have been "return"ed if this was a regular function
         if self._is_multiclass():
             prob_classa = np.asarray(prob_classa).reshape((-1,self.config.n_classes+1))
             prob_classa = prob_classa[idx]
-            return proba, dista, prob_classa, pointsa
+            yield proba, dista, prob_classa, pointsa
         else:
             prob_classa = None
-            return proba, dista, pointsa
+            yield proba, dista, pointsa
 
 
-    def predict_instances(self, img, axes=None, normalizer=None,
-                          sparse=True,
-                          prob_thresh=None, nms_thresh=None,
-                          scale=None,
-                          n_tiles=None, show_tile_progress=True,
-                          verbose=False,
-                          return_labels=True,
-                          predict_kwargs=None, nms_kwargs=None,
-                          overlap_label=None, return_predict=False):
+    @functools.wraps(_predict_sparse_generator)
+    def predict_sparse(self, *args, **kwargs):
+        # return last "yield"ed value of generator
+        r = None
+        for r in self._predict_sparse_generator(*args, **kwargs):
+            pass
+        return r
+
+
+    def _predict_instances_generator(self, img, axes=None, normalizer=None,
+                                     sparse=True,
+                                     prob_thresh=None, nms_thresh=None,
+                                     scale=None,
+                                     n_tiles=None, show_tile_progress=True,
+                                     verbose=False,
+                                     return_labels=True,
+                                     predict_kwargs=None, nms_kwargs=None,
+                                     overlap_label=None, return_predict=False):
         """Predict instance segmentation from input image.
 
         Parameters
@@ -731,7 +767,7 @@ class StarDistBase(BaseModel):
             Perform non-maximum suppression that considers two objects to be the same
             when their area/surface overlap exceeds this threshold (also see `optimize_thresholds`).
         scale: None or float or iterable
-            Scale the input image internally by this factor and rescale the output accordingly. 
+            Scale the input image internally by this factor and rescale the output accordingly.
             All spatial axes (X,Y,Z) will be scaled if a scalar value is provided.
             Alternatively, multiple scale values (compatible with input `axes`) can be used
             for more fine-grained control (scale values for non-spatial axes must be 1).
@@ -792,12 +828,18 @@ class StarDistBase(BaseModel):
             verbose and print(f"scaling image by factors {scale} for axes {_axes}")
             img = ndi.zoom(img, scale, order=1)
 
+        yield 'predict'  # indicate that prediction is starting
+        res = None
         if sparse:
-            res = self.predict_sparse(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles,
-                                      prob_thresh=prob_thresh, show_tile_progress=show_tile_progress, **predict_kwargs)
+            for res in self._predict_sparse_generator(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles,
+                                                      prob_thresh=prob_thresh, show_tile_progress=show_tile_progress, **predict_kwargs):
+                if res is None:
+                    yield 'tile'  # yield 'tile' each time a tile has been processed
         else:
-            res = self.predict(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles,
-                               show_tile_progress=show_tile_progress, **predict_kwargs)
+            for res in self._predict_generator(img, axes=axes, normalizer=normalizer, n_tiles=n_tiles,
+                                               show_tile_progress=show_tile_progress, **predict_kwargs):
+                if res is None:
+                    yield 'tile'  # yield 'tile' each time a tile has been processed
             res = tuple(res) + (None,)
 
         if self._is_multiclass():
@@ -806,6 +848,7 @@ class StarDistBase(BaseModel):
             prob, dist, points = res
             prob_class = None
 
+        yield 'nms'  # indicate that non-maximum suppression is starting
         res_instances = self._instances_from_prediction(_shape_inst, prob, dist,
                                                         points=points,
                                                         prob_class=prob_class,
@@ -816,10 +859,29 @@ class StarDistBase(BaseModel):
                                                         overlap_label=overlap_label,
                                                         **nms_kwargs)
 
+        # last "yield" is the actual output that would have been "return"ed if this was a regular function
         if return_predict:
-            return res_instances, tuple(res[:-1])
+            yield res_instances, tuple(res[:-1])
         else:
-            return res_instances
+            yield res_instances
+
+
+    @functools.wraps(_predict_instances_generator)
+    def predict_instances(self, *args, **kwargs):
+        # the reason why the actual computation happens as a generator function
+        # (in '_predict_instances_generator') is that the generator is called
+        # from the stardist napari plugin, which has its benefits regarding
+        # control flow and progress display. however, typical use cases should
+        # almost always use this function ('predict_instances'), and shouldn't
+        # even notice (thanks to @functools.wraps) that it wraps the generator
+        # function. note that similar reasoning applies to 'predict' and
+        # 'predict_sparse'.
+
+        # return last "yield"ed value of generator
+        r = None
+        for r in self._predict_instances_generator(*args, **kwargs):
+            pass
+        return r
 
 
     # def _predict_instances_old(self, img, axes=None, normalizer=None,
@@ -1097,11 +1159,13 @@ class StarDistBase(BaseModel):
         return axes_check_and_normalize(axes, img.ndim)
 
 
-    def _compute_receptive_field(self, img_size=None):
+    def _compute_receptive_field(self, img_size=None, keras_model=None):
         # TODO: good enough?
         from scipy.ndimage import zoom
         if img_size is None:
             img_size = tuple(g*(128 if self.config.n_dim==2 else 64) for g in self.config.grid)
+        if keras_model is None:
+            keras_model = self.keras_model
         if np.isscalar(img_size):
             img_size = (img_size,) * self.config.n_dim
         img_size = tuple(img_size)
@@ -1111,14 +1175,20 @@ class StarDistBase(BaseModel):
         x = np.zeros((1,)+img_size+(self.config.n_channel_in,), dtype=np.float32)
         z = np.zeros_like(x)
         x[(0,)+mid+(slice(None),)] = 1
-        y  = self.keras_model.predict(x)[0][0,...,0]
-        y0 = self.keras_model.predict(z)[0][0,...,0]
+        y  = keras_model.predict(x, verbose=0)[0][0,...,0]
+        y0 = keras_model.predict(z, verbose=0)[0][0,...,0]
         grid = tuple((np.array(x.shape[1:-1])/np.array(y.shape)).astype(int))
         assert grid == self.config.grid
         y  = zoom(y, grid,order=0)
         y0 = zoom(y0,grid,order=0)
         ind = np.where(np.abs(y-y0)>0)
-        return [(m-np.min(i), np.max(i)-m) for (m,i) in zip(mid,ind)]
+        if any(len(i)==0 for i in ind):
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()) as _:
+                keras_model_untrained = type(self)(self.config,basedir=None).keras_model
+            return self._compute_receptive_field(img_size=img_size, keras_model=keras_model_untrained)
+        else:
+            return [(m-np.min(i), np.max(i)-m) for (m,i) in zip(mid,ind)]
 
 
     def _axes_tile_overlap(self, query_axes):
@@ -1234,7 +1304,7 @@ class StarDistPadAndCropResizer(Resizer):
         idx = np.where(np.all(points< bounds, 1))
         return idx
 
-    
+
 
 def _tf_version_at_least(version_string="1.0.0"):
     from packaging import version

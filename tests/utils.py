@@ -2,7 +2,7 @@ import os
 import numpy as np
 from tifffile import imread
 from skimage.measure import label
-from scipy.ndimage.filters import gaussian_filter
+from scipy.ndimage import gaussian_filter
 from pathlib import Path
 from timeit import default_timer
 from csbdeep.utils.tf import keras_import
@@ -30,6 +30,14 @@ class Timer(object):
         print(eval(f'f"{self.message}: {self.fmt}"'))
         self.t = t
 
+
+def crop(*images, shape=(256,256)):
+    """Crop central region of given shape"""
+    if isinstance(images,(tuple,list)) and len(images) == 1 and isinstance(images[0],(tuple,list)):
+        images = images[0]
+    assert all(all(s>=m for s,m in zip(u.shape,shape)) for u in images)
+    res = tuple(u[tuple(slice((s-m)//2,(s-m)//2+m) for s,m in zip(u.shape,shape))] for u in images)
+    return res[0] if len(res) == 1 else res
 
 
 def random_image(shape=(128, 128)):
@@ -98,3 +106,9 @@ def path_model3d():
     return Path(_root_dir()) / '..' / 'models' / 'examples' / '3D_demo'
 
 
+def check_same_shapes(*arrays, shape_index=None):
+    if len(arrays) < 2: return
+    shape_index = slice(None) if shape_index is None else shape_index
+    shape = arrays[0].shape
+    debug = f"full array shapes: {[a.shape for a in arrays]}\nindexed array shapes: {[a.shape[shape_index] for a in arrays]}"
+    assert all(a.shape[shape_index] == shape[shape_index] for a in arrays), debug
