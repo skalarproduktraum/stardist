@@ -138,11 +138,11 @@ setup(
 
     install_requires=[
         'csbdeep>=0.8.0',
-        'scikit-image',
+        'scikit-image<0.25.0',
         'numba',
         'imageio',
         'scikit-learn',
-        'opencv-python',
+        'opencv-python<=4.10.0',
         'pandas',
         'augmend @ git+https://github.com/stardist/augmend.git'
     ],
